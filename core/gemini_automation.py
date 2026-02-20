@@ -619,21 +619,73 @@ class GeminiAutomation:
         """点击重新发送验证码按钮"""
         time.sleep(2)
 
-        # 查找包含重新发送关键词的按钮（与 _find_verify_button 相反）
-        try:
-            buttons = page.eles("tag:button")
-            for btn in buttons:
-                text = (btn.text or "").strip().lower()
-                if text and ("重新" in text or "resend" in text):
-                    try:
-                        self._log("info", f"🔄 点击重新发送按钮")
-                        btn.click()
-                        time.sleep(2)
-                        return True
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        def _find_resend_button():
+            selectors = [
+                "css:button[jsname='WGPTvf']",
+                "css:button[aria-label*='重新发送验证码']",
+                "css:button[aria-label*='Resend']",
+                "xpath://span[@jsname='V67aGc' and contains(normalize-space(.), '重新发送验证码')]/ancestor::button[1]",
+            ]
+
+            for selector in selectors:
+                try:
+                    btn = page.ele(selector, timeout=1)
+                    if btn:
+                        return btn
+                except Exception:
+                    continue
+
+            try:
+                buttons = page.eles("tag:button")
+                for btn in buttons:
+                    text = (btn.text or "").strip().lower()
+                    if text and ("重新" in text or "resend" in text):
+                        return btn
+            except Exception:
+                pass
+            return None
+
+        def _is_disabled(btn) -> bool:
+            try:
+                disabled_attr = btn.attr("disabled")
+                if disabled_attr is not None:
+                    return True
+                aria_disabled = str(btn.attr("aria-disabled") or "").strip().lower()
+                if aria_disabled in ("true", "1"):
+                    return True
+            except Exception:
+                pass
+            return False
+
+        wait_seconds = 45
+        deadline = time.time() + wait_seconds
+        logged_disabled = False
+
+        while time.time() < deadline:
+            btn = _find_resend_button()
+            if not btn:
+                time.sleep(1)
+                continue
+
+            if _is_disabled(btn):
+                if not logged_disabled:
+                    self._log("info", "⏳ 已找到重新发送按钮，但当前不可点击，等待变为可用...")
+                    logged_disabled = True
+                time.sleep(1)
+                continue
+
+            try:
+                self._log("info", "🔄 点击重新发送按钮")
+                btn.click()
+            except Exception:
+                try:
+                    btn.run_js("this.click();")
+                except Exception:
+                    time.sleep(1)
+                    continue
+
+            time.sleep(2)
+            return True
 
         return False
 
