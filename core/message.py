@@ -5,9 +5,10 @@
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import re
-from typing import List, TYPE_CHECKING
+from typing import Any, Dict, List, TYPE_CHECKING
 
 import httpx
 
@@ -70,8 +71,30 @@ def extract_text_from_content(content) -> str:
     elif isinstance(content, list):
         # 多模态消息：只提取文本部分
         return "".join([x.get("text", "") for x in content if x.get("type") == "text"])
+    elif content is None:
+        return ""
     else:
         return str(content)
+
+
+def format_tool_calls_text(tool_calls: List[Dict[str, Any]]) -> str:
+    """把 assistant 的 tool_calls 转成可读文本，便于上游理解上下文。"""
+    lines = []
+    for tool_call in tool_calls:
+        function_obj = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        name = function_obj.get("name") or tool_call.get("name") or "unknown_tool"
+        arguments = function_obj.get("arguments")
+        if arguments is None:
+            arguments = tool_call.get("arguments")
+
+        if isinstance(arguments, str):
+            args_text = arguments
+        else:
+            args_text = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+
+        lines.append(f"{name}: {args_text}")
+
+    return "\n".join(lines)
 
 
 async def parse_last_message(messages: List['Message'], http_client: httpx.AsyncClient, request_id: str = ""):
@@ -88,6 +111,8 @@ async def parse_last_message(messages: List['Message'], http_client: httpx.Async
 
     if isinstance(content, str):
         text_content = content
+    elif isinstance(content, dict):
+        text_content = json.dumps(content, ensure_ascii=False)
     elif isinstance(content, list):
         for part in content:
             if part.get("type") == "text":
@@ -102,6 +127,24 @@ async def parse_last_message(messages: List['Message'], http_client: httpx.Async
                     image_urls.append(url)
                 else:
                     logger.warning(f"[FILE] [req_{request_id}] 不支持的文件格式: {url[:30]}...")
+
+    # tool role 场景：将工具输出包装为显式上下文
+    role_lower = (last_msg.role or "").lower()
+    if role_lower == "tool":
+        tool_name = getattr(last_msg, "name", None) or "tool"
+        tool_call_id = getattr(last_msg, "tool_call_id", None)
+        call_part = f" ({tool_call_id})" if tool_call_id else ""
+        text_content = f"Tool result from {tool_name}{call_part}:\n{text_content}"
+    elif role_lower == "assistant":
+        assistant_tool_calls = getattr(last_msg, "tool_calls", None) or []
+        assistant_function_call = getattr(last_msg, "function_call", None)
+        if assistant_tool_calls:
+            tool_text = format_tool_calls_text(assistant_tool_calls)
+            text_content = f"Assistant requested tool calls:\n{tool_text}" + (f"\n{text_content}" if text_content else "")
+        elif isinstance(assistant_function_call, dict) and assistant_function_call.get("name"):
+            fn_name = assistant_function_call.get("name")
+            fn_args = assistant_function_call.get("arguments", "{}")
+            text_content = f"Assistant requested function call: {fn_name}({fn_args})" + (f"\n{text_content}" if text_content else "")
 
     # 并行下载所有 URL 文件（支持图片、PDF、文档等）
     if image_urls:
@@ -141,8 +184,31 @@ def build_full_context_text(messages: List['Message']) -> str:
     """仅拼接历史文本，图片只处理当次请求的"""
     prompt = ""
     for msg in messages:
-        role = "User" if msg.role in ["user", "system"] else "Assistant"
+        role_lower = (msg.role or "").lower()
+        if role_lower == "system":
+            role = "System"
+        elif role_lower == "user":
+            role = "User"
+        elif role_lower == "tool":
+            tool_name = getattr(msg, "name", None) or "tool"
+            role = f"Tool[{tool_name}]"
+        elif role_lower == "assistant":
+            role = "Assistant"
+        else:
+            role = msg.role or "Assistant"
+
         content_str = extract_text_from_content(msg.content)
+
+        if role_lower == "assistant":
+            assistant_tool_calls = getattr(msg, "tool_calls", None) or []
+            assistant_function_call = getattr(msg, "function_call", None)
+            if assistant_tool_calls:
+                tool_text = format_tool_calls_text(assistant_tool_calls)
+                content_str = (content_str + "\n" if content_str else "") + f"Tool calls:\n{tool_text}"
+            elif isinstance(assistant_function_call, dict) and assistant_function_call.get("name"):
+                fn_name = assistant_function_call.get("name")
+                fn_args = assistant_function_call.get("arguments", "{}")
+                content_str = (content_str + "\n" if content_str else "") + f"Function call: {fn_name}({fn_args})"
 
         # 为多模态消息添加图片标记
         if isinstance(msg.content, list):

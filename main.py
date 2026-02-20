@@ -1063,7 +1063,11 @@ def get_sanitized_logs(limit: int = 100) -> list:
 
 class Message(BaseModel):
     role: str
-    content: Union[str, List[Dict[str, Any]]]
+    content: Optional[Union[str, List[Dict[str, Any]], Dict[str, Any]]] = None
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    function_call: Optional[Dict[str, Any]] = None
 
 class ChatRequest(BaseModel):
     model: str = "gemini-auto"
@@ -1071,6 +1075,203 @@ class ChatRequest(BaseModel):
     stream: bool = False
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 1.0
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    parallel_tool_calls: Optional[bool] = None
+    functions: Optional[List[Dict[str, Any]]] = None
+    function_call: Optional[Union[str, Dict[str, Any]]] = None
+
+
+def normalize_tools_from_request(req: ChatRequest) -> List[Dict[str, Any]]:
+    """统一兼容 OpenAI tools/functions 两种字段。"""
+    normalized_tools: List[Dict[str, Any]] = []
+
+    if req.tools:
+        for tool in req.tools:
+            if isinstance(tool, dict) and tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+                normalized_tools.append(tool)
+
+    if req.functions:
+        for fn in req.functions:
+            if isinstance(fn, dict):
+                normalized_tools.append({"type": "function", "function": fn})
+
+    return normalized_tools
+
+
+def extract_forced_tool_name(tool_choice: Optional[Union[str, Dict[str, Any]]], function_call: Optional[Union[str, Dict[str, Any]]]) -> Optional[str]:
+    """提取强制调用的工具名（若有）。"""
+
+    if isinstance(tool_choice, dict):
+        function_obj = tool_choice.get("function") if isinstance(tool_choice.get("function"), dict) else None
+        if function_obj and isinstance(function_obj.get("name"), str):
+            return function_obj["name"].strip() or None
+
+    if isinstance(function_call, dict):
+        if isinstance(function_call.get("name"), str):
+            return function_call["name"].strip() or None
+
+    return None
+
+
+def build_tool_call_instruction(
+    tools: List[Dict[str, Any]],
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+    function_call: Optional[Union[str, Dict[str, Any]]] = None,
+) -> str:
+    """构造给上游模型的 tool_call 模拟约束。"""
+    if not tools:
+        return ""
+
+    function_tools = [t.get("function", {}) for t in tools if isinstance(t, dict) and t.get("type") == "function"]
+    function_tools = [f for f in function_tools if isinstance(f, dict) and f.get("name")]
+    if not function_tools:
+        return ""
+
+    if tool_choice == "none" or function_call == "none":
+        return "\n[Tool Calling Rule]\nYou MUST NOT call any tool. Answer with normal text only."
+
+    forced_tool_name = extract_forced_tool_name(tool_choice, function_call)
+    tool_names = [str(f.get("name")) for f in function_tools]
+    tool_desc_lines = []
+    for fn in function_tools:
+        fn_name = str(fn.get("name", "")).strip()
+        if not fn_name:
+            continue
+        fn_desc = str(fn.get("description", "")).strip()
+        if fn_desc:
+            tool_desc_lines.append(f"- {fn_name}: {fn_desc}")
+        else:
+            tool_desc_lines.append(f"- {fn_name}")
+
+    if forced_tool_name and forced_tool_name not in tool_names:
+        forced_tool_name = None
+
+    if forced_tool_name:
+        choice_rule = f"You MUST call exactly one tool: {forced_tool_name}."
+    else:
+        choice_rule = "If a tool is needed, call one or more tools; otherwise answer normally."
+
+    instruction = (
+        "\n[Tool Calling Rule]\n"
+        f"Available tools:\n{chr(10).join(tool_desc_lines)}\n"
+        f"{choice_rule}\n"
+        "If calling tool(s), respond ONLY with valid JSON, no markdown:\n"
+        "{\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{...}}]}\n"
+        "If not calling tools, return normal plain text response."
+    )
+    return instruction
+
+
+def _normalize_tool_arguments(arguments: Any) -> str:
+    if isinstance(arguments, str):
+        arguments = arguments.strip()
+        if not arguments:
+            return "{}"
+        try:
+            json.loads(arguments)
+            return arguments
+        except Exception:
+            return json.dumps({"input": arguments}, ensure_ascii=False)
+
+    if isinstance(arguments, (dict, list)):
+        return json.dumps(arguments, ensure_ascii=False)
+
+    if arguments is None:
+        return "{}"
+
+    return json.dumps({"input": arguments}, ensure_ascii=False)
+
+
+def _build_single_tool_call(raw_call: Dict[str, Any], allowed_tool_names: Optional[set[str]] = None) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_call, dict):
+        return None
+
+    function_name = None
+    arguments = None
+
+    if isinstance(raw_call.get("function"), dict):
+        function_name = raw_call["function"].get("name")
+        arguments = raw_call["function"].get("arguments")
+    elif raw_call.get("name"):
+        function_name = raw_call.get("name")
+        arguments = raw_call.get("arguments", raw_call.get("args", raw_call.get("parameters")))
+
+    if not function_name:
+        return None
+
+    function_name = str(function_name).strip()
+    if not function_name:
+        return None
+    if allowed_tool_names is not None and function_name not in allowed_tool_names:
+        return None
+
+    return {
+        "id": str(raw_call.get("id") or f"call_{uuid.uuid4().hex[:24]}"),
+        "type": "function",
+        "function": {
+            "name": function_name,
+            "arguments": _normalize_tool_arguments(arguments)
+        }
+    }
+
+
+def _parse_tool_calls_payload(payload: Any, allowed_tool_names: Optional[set[str]] = None) -> List[Dict[str, Any]]:
+    raw_calls: List[Dict[str, Any]] = []
+
+    if isinstance(payload, dict):
+        if isinstance(payload.get("tool_calls"), list):
+            raw_calls = [c for c in payload["tool_calls"] if isinstance(c, dict)]
+        elif isinstance(payload.get("tool_call"), dict):
+            raw_calls = [payload["tool_call"]]
+        elif isinstance(payload.get("function_call"), dict):
+            raw_calls = [payload["function_call"]]
+        elif payload.get("name"):
+            raw_calls = [payload]
+    elif isinstance(payload, list):
+        raw_calls = [c for c in payload if isinstance(c, dict)]
+
+    normalized = []
+    for raw_call in raw_calls:
+        tool_call = _build_single_tool_call(raw_call, allowed_tool_names)
+        if tool_call:
+            normalized.append(tool_call)
+    return normalized
+
+
+def extract_simulated_tool_calls(text: str, allowed_tool_names: Optional[set[str]] = None) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """从模型文本里提取模拟 tool_calls。"""
+    if not text:
+        return [], text
+
+    stripped = text.strip()
+    candidates: List[tuple[str, Optional[tuple[int, int]]]] = []
+    if stripped:
+        candidates.append((stripped, None))
+
+    fenced_pattern = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+    for match in fenced_pattern.finditer(text):
+        block = match.group(1).strip()
+        if block:
+            candidates.append((block, match.span()))
+
+    for candidate, span in candidates:
+        try:
+            payload = json.loads(candidate)
+        except Exception:
+            continue
+
+        tool_calls = _parse_tool_calls_payload(payload, allowed_tool_names)
+        if not tool_calls:
+            continue
+
+        if span is None:
+            return tool_calls, None
+
+        remaining = (text[:span[0]] + text[span[1]:]).strip()
+        return tool_calls, (remaining or None)
+
+    return [], text
 
 class ImageGenerationRequest(BaseModel):
     """OpenAI /v1/images/generations 请求格式"""
@@ -1097,6 +1298,26 @@ def create_chunk(id: str, created: int, model: str, delta: dict, finish_reason: 
         "system_fingerprint": None  # OpenAI 标准字段（可选）
     }
     return json.dumps(chunk)
+
+
+def create_tool_call_delta_chunk(
+    id: str,
+    created: int,
+    model: str,
+    tool_call: Dict[str, Any],
+    index: int,
+) -> str:
+    function_obj = tool_call.get("function", {}) if isinstance(tool_call.get("function"), dict) else {}
+    call_delta = {
+        "index": index,
+        "id": tool_call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+        "type": "function",
+        "function": {
+            "name": function_obj.get("name", ""),
+            "arguments": function_obj.get("arguments", "{}")
+        }
+    }
+    return create_chunk(id, created, model, {"tool_calls": [call_delta]}, None)
 # ---------- Auth endpoints (API) ----------
 
 @app.post("/login")
@@ -1974,6 +2195,8 @@ async def chat_impl(
     request.state.model = req.model
 
     required_quota_types = get_required_quota_types(req.model)
+    normalized_tools = normalize_tools_from_request(req)
+    tool_instruction = build_tool_call_instruction(normalized_tools, req.tool_choice, req.function_call)
 
     # 3. 生成会话指纹，获取Session锁（防止同一对话的并发请求冲突）
     conv_key = get_conversation_key([m.model_dump() for m in req.messages], client_ip)
@@ -2070,6 +2293,11 @@ async def chat_impl(
     # 3. 解析请求内容
     try:
         last_text, current_images = await parse_last_message(req.messages, http_client, request_id)
+        if tool_instruction:
+            if last_text:
+                last_text = f"{last_text}\n\n{tool_instruction}"
+            else:
+                last_text = tool_instruction
     except HTTPException as e:
         status = classify_error_status(e.status_code, e)
         await finalize_result(status, e.status_code, f"HTTP {e.status_code}: {e.detail}")
@@ -2133,6 +2361,11 @@ async def chat_impl(
                 # 准备文本（重试模式下发全文）
                 if current_retry_mode:
                     current_text = build_full_context_text(req.messages)
+                    if tool_instruction:
+                        if current_text:
+                            current_text = f"{current_text}\n\n{tool_instruction}"
+                        else:
+                            current_text = tool_instruction
 
                 # 发起对话
                 async for chunk in stream_chat_generator(
@@ -2231,7 +2464,80 @@ async def chat_impl(
                     return
 
     if req.stream:
-        return StreamingResponse(response_wrapper(), media_type="text/event-stream")
+        if not normalized_tools:
+            return StreamingResponse(response_wrapper(), media_type="text/event-stream")
+
+        async def tool_stream_wrapper():
+            full_content = ""
+            full_reasoning = ""
+            upstream_error_payload = None
+
+            async for chunk_str in response_wrapper():
+                if chunk_str.startswith("data: [DONE]"):
+                    break
+                if not chunk_str.startswith("data: "):
+                    continue
+
+                payload_str = chunk_str[6:]
+                try:
+                    data = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if isinstance(data, dict) and data.get("error"):
+                    upstream_error_payload = data
+                    break
+
+                try:
+                    delta = data["choices"][0]["delta"]
+                except (KeyError, IndexError, TypeError):
+                    continue
+
+                if "content" in delta and isinstance(delta["content"], str):
+                    full_content += delta["content"]
+                if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
+                    full_reasoning += delta["reasoning_content"]
+
+            if upstream_error_payload is not None:
+                yield f"data: {json.dumps(upstream_error_payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            allowed_tool_names = {
+                str(tool.get("function", {}).get("name"))
+                for tool in normalized_tools
+                if isinstance(tool, dict) and isinstance(tool.get("function"), dict) and tool.get("function", {}).get("name")
+            }
+            simulated_tool_calls, cleaned_content = extract_simulated_tool_calls(full_content, allowed_tool_names or None)
+
+            role_chunk = create_chunk(chat_id, created_time, req.model, {"role": "assistant"}, None)
+            yield f"data: {role_chunk}\n\n"
+
+            if full_reasoning:
+                reasoning_chunk = create_chunk(chat_id, created_time, req.model, {"reasoning_content": full_reasoning}, None)
+                yield f"data: {reasoning_chunk}\n\n"
+
+            if simulated_tool_calls:
+                logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] stream识别到模拟tool_calls: {len(simulated_tool_calls)}个")
+                for idx, call in enumerate(simulated_tool_calls):
+                    tool_call_chunk = create_tool_call_delta_chunk(chat_id, created_time, req.model, call, idx)
+                    yield f"data: {tool_call_chunk}\n\n"
+
+                final_chunk = create_chunk(chat_id, created_time, req.model, {}, "tool_calls")
+                yield f"data: {final_chunk}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            text_to_send = cleaned_content if cleaned_content is not None else full_content
+            if text_to_send:
+                content_chunk = create_chunk(chat_id, created_time, req.model, {"content": text_to_send}, None)
+                yield f"data: {content_chunk}\n\n"
+
+            final_chunk = create_chunk(chat_id, created_time, req.model, {}, "stop")
+            yield f"data: {final_chunk}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(tool_stream_wrapper(), media_type="text/event-stream")
     
     full_content = ""
     full_reasoning = ""
@@ -2250,8 +2556,30 @@ async def chat_impl(
             except (KeyError, IndexError) as e:
                 logger.error(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 响应格式错误 ({type(e).__name__}): {str(e)}")
 
+    simulated_tool_calls = []
+    cleaned_content: Optional[str] = full_content
+    finish_reason = "stop"
+    if normalized_tools and full_content:
+        allowed_tool_names = {
+            str(tool.get("function", {}).get("name"))
+            for tool in normalized_tools
+            if isinstance(tool, dict) and isinstance(tool.get("function"), dict) and tool.get("function", {}).get("name")
+        }
+        simulated_tool_calls, cleaned_content = extract_simulated_tool_calls(full_content, allowed_tool_names or None)
+        if simulated_tool_calls:
+            finish_reason = "tool_calls"
+            logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 识别到模拟tool_calls: {len(simulated_tool_calls)}个")
+
     # 构建响应消息
-    message = {"role": "assistant", "content": full_content}
+    if simulated_tool_calls:
+        message = {
+            "role": "assistant",
+            "content": cleaned_content,
+            "tool_calls": simulated_tool_calls
+        }
+    else:
+        message = {"role": "assistant", "content": full_content}
+
     if full_reasoning:
         message["reasoning_content"] = full_reasoning
 
@@ -2259,7 +2587,9 @@ async def chat_impl(
     logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 非流式响应完成")
 
     # 记录响应内容（限制500字符）
-    response_preview = full_content[:500] + "...(已截断)" if len(full_content) > 500 else full_content
+    preview_base = cleaned_content if cleaned_content is not None else full_content
+    preview_base = preview_base or ""
+    response_preview = preview_base[:500] + "...(已截断)" if len(preview_base) > 500 else preview_base
     logger.info(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] AI响应: {response_preview}")
 
     return {
@@ -2267,7 +2597,7 @@ async def chat_impl(
         "object": "chat.completion",
         "created": created_time,
         "model": req.model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     }
 
