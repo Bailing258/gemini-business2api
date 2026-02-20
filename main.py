@@ -1082,6 +1082,451 @@ class ChatRequest(BaseModel):
     function_call: Optional[Union[str, Dict[str, Any]]] = None
 
 
+class ClaudeMessageRequest(BaseModel):
+    """Anthropic /v1/messages 兼容请求结构（子集）。"""
+    model: str = "gemini-auto"
+    messages: List[Dict[str, Any]]
+    system: Optional[Union[str, List[Dict[str, Any]]]] = None
+    max_tokens: Optional[int] = 4096
+    stream: bool = False
+    temperature: Optional[float] = 0.7
+    top_p: Optional[float] = 1.0
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+
+
+def resolve_api_authorization(authorization: Optional[str], x_api_key: Optional[str]) -> Optional[str]:
+    """兼容 Authorization 与 x-api-key 两种鉴权头。"""
+    if authorization:
+        return authorization
+    if x_api_key:
+        return f"Bearer {x_api_key}"
+    return None
+
+
+def extract_text_from_claude_content(content: Any) -> str:
+    """从 Claude content(字符串/blocks)中提取可读文本。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    parts: List[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            parts.append(str(block.get("text", "")))
+        elif block_type == "tool_result":
+            tool_result_content = block.get("content")
+            if isinstance(tool_result_content, str):
+                parts.append(tool_result_content)
+            elif isinstance(tool_result_content, list):
+                parts.append(extract_text_from_claude_content(tool_result_content))
+            elif tool_result_content is not None:
+                parts.append(str(tool_result_content))
+    return "".join(parts)
+
+
+def normalize_claude_system(system: Optional[Union[str, List[Dict[str, Any]]]]) -> str:
+    if system is None:
+        return ""
+    if isinstance(system, str):
+        return system
+    return extract_text_from_claude_content(system)
+
+
+def convert_claude_tools_to_openai(tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """将 Anthropic tools 转为 OpenAI tools。"""
+    normalized: List[Dict[str, Any]] = []
+    if not tools:
+        return normalized
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name", "")).strip()
+        if not name:
+            continue
+
+        input_schema = tool.get("input_schema")
+        if not isinstance(input_schema, dict):
+            input_schema = {"type": "object", "properties": {}}
+
+        normalized.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": str(tool.get("description", "") or ""),
+                "parameters": input_schema
+            }
+        })
+
+    return normalized
+
+
+def convert_claude_tool_choice_to_openai(tool_choice: Optional[Union[str, Dict[str, Any]]]) -> Optional[Union[str, Dict[str, Any]]]:
+    """将 Anthropic tool_choice 转为 OpenAI 风格。"""
+    if tool_choice is None:
+        return None
+
+    if isinstance(tool_choice, str):
+        mapping = {
+            "auto": "auto",
+            "none": "none",
+            "any": "required",
+            "required": "required",
+        }
+        return mapping.get(tool_choice, tool_choice)
+
+    if isinstance(tool_choice, dict):
+        choice_type = str(tool_choice.get("type", "")).strip().lower()
+        if choice_type == "auto":
+            return "auto"
+        if choice_type == "none":
+            return "none"
+        if choice_type == "any":
+            return "required"
+        if choice_type == "tool":
+            tool_name = str(tool_choice.get("name", "")).strip()
+            if tool_name:
+                return {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name
+                    }
+                }
+
+    return None
+
+
+def convert_claude_messages_to_openai(messages: List[Dict[str, Any]]) -> List[Message]:
+    """将 Anthropic messages 转为内部 OpenAI 消息结构。"""
+    converted: List[Message] = []
+
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+
+        role = str(item.get("role", "user") or "user").lower()
+        content = item.get("content", "")
+
+        if isinstance(content, str):
+            converted.append(Message(role=role, content=content))
+            continue
+
+        if not isinstance(content, list):
+            converted.append(Message(role=role, content=str(content)))
+            continue
+
+        if role == "assistant":
+            text_parts: List[str] = []
+            tool_calls: List[Dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if block_type == "text":
+                    text_parts.append(str(block.get("text", "")))
+                elif block_type == "tool_use":
+                    tool_name = str(block.get("name", "")).strip()
+                    if not tool_name:
+                        continue
+                    tool_calls.append({
+                        "id": str(block.get("id") or f"call_{uuid.uuid4().hex[:24]}"),
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": _normalize_tool_arguments(block.get("input", {}))
+                        }
+                    })
+
+            assistant_text = "".join(text_parts)
+            converted.append(
+                Message(
+                    role="assistant",
+                    content=assistant_text,
+                    tool_calls=tool_calls or None
+                )
+            )
+            continue
+
+        if role == "user":
+            text_parts: List[str] = []
+            multimodal_parts: List[Dict[str, Any]] = []
+            tool_result_messages: List[Message] = []
+
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+
+                if block_type == "text":
+                    block_text = str(block.get("text", ""))
+                    text_parts.append(block_text)
+                    multimodal_parts.append({"type": "text", "text": block_text})
+                    continue
+
+                if block_type == "image":
+                    source = block.get("source", {}) if isinstance(block.get("source"), dict) else {}
+                    source_type = source.get("type")
+                    image_url = ""
+                    if source_type == "base64":
+                        media_type = str(source.get("media_type", "image/png") or "image/png")
+                        data = source.get("data", "")
+                        if data:
+                            image_url = f"data:{media_type};base64,{data}"
+                    elif source_type == "url":
+                        image_url = str(source.get("url", ""))
+
+                    if image_url:
+                        multimodal_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+                    continue
+
+                if block_type == "tool_result":
+                    tool_call_id = str(block.get("tool_use_id", "") or "")
+                    tool_name = str(block.get("name", "tool") or "tool")
+                    result_content = block.get("content")
+                    result_text = extract_text_from_claude_content(result_content)
+                    if not result_text and result_content is not None:
+                        result_text = str(result_content)
+
+                    tool_result_messages.append(
+                        Message(
+                            role="tool",
+                            name=tool_name,
+                            tool_call_id=tool_call_id or None,
+                            content=result_text
+                        )
+                    )
+                    continue
+
+            # 如果包含 tool_result，优先拆成 tool role；并保留用户文本
+            if tool_result_messages:
+                user_text = "".join(text_parts)
+                if user_text:
+                    converted.append(Message(role="user", content=user_text))
+                converted.extend(tool_result_messages)
+            elif any(part.get("type") == "image_url" for part in multimodal_parts):
+                if not any(part.get("type") == "text" for part in multimodal_parts):
+                    multimodal_parts.insert(0, {"type": "text", "text": ""})
+                converted.append(Message(role="user", content=multimodal_parts))
+            else:
+                converted.append(Message(role="user", content="".join(text_parts)))
+
+            continue
+
+        # 兜底：未知 role 按文本透传
+        converted.append(Message(role=role, content=extract_text_from_claude_content(content)))
+
+    return converted
+
+
+def build_openai_request_from_claude(req: ClaudeMessageRequest) -> ChatRequest:
+    """将 Anthropic /v1/messages 请求桥接为内部 ChatRequest。"""
+    openai_messages: List[Message] = []
+
+    system_text = normalize_claude_system(req.system)
+    if system_text:
+        openai_messages.append(Message(role="system", content=system_text))
+
+    openai_messages.extend(convert_claude_messages_to_openai(req.messages))
+
+    return ChatRequest(
+        model=req.model,
+        messages=openai_messages,
+        stream=False,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        tools=convert_claude_tools_to_openai(req.tools),
+        tool_choice=convert_claude_tool_choice_to_openai(req.tool_choice),
+    )
+
+
+def parse_tool_arguments_to_obj(arguments: Any) -> Dict[str, Any]:
+    """将 tool arguments 安全转成 JSON object。"""
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, list):
+        return {"items": arguments}
+    if arguments is None:
+        return {}
+
+    if isinstance(arguments, str):
+        stripped = arguments.strip()
+        if not stripped:
+            return {}
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, list):
+                return {"items": parsed}
+            return {"value": parsed}
+        except Exception:
+            return {"raw": stripped}
+
+    return {"value": arguments}
+
+
+def map_openai_finish_reason_to_claude(stop_reason: Optional[str]) -> str:
+    mapping = {
+        "stop": "end_turn",
+        "tool_calls": "tool_use",
+        "length": "max_tokens",
+        "content_filter": "stop_sequence",
+    }
+    return mapping.get(stop_reason or "", "end_turn")
+
+
+def convert_openai_response_to_claude_message(openai_response: Dict[str, Any], fallback_model: str) -> Dict[str, Any]:
+    """将 OpenAI chat completion 转换为 Anthropic message 响应。"""
+    choice = ((openai_response.get("choices") or [{}])[0]) if isinstance(openai_response, dict) else {}
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+
+    content_blocks: List[Dict[str, Any]] = []
+    text_content = message.get("content")
+    if isinstance(text_content, str) and text_content:
+        content_blocks.append({"type": "text", "text": text_content})
+
+    tool_calls = message.get("tool_calls") or []
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function_obj = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+            tool_name = str(function_obj.get("name", "")).strip()
+            if not tool_name:
+                continue
+            tool_input = parse_tool_arguments_to_obj(function_obj.get("arguments"))
+            content_blocks.append({
+                "type": "tool_use",
+                "id": str(tool_call.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"),
+                "name": tool_name,
+                "input": tool_input,
+            })
+
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+
+    usage = openai_response.get("usage") if isinstance(openai_response, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+
+    finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None
+    stop_reason = map_openai_finish_reason_to_claude(finish_reason)
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": openai_response.get("model") or fallback_model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("completion_tokens") or 0),
+        },
+    }
+
+
+def build_claude_sse_event(event_type: str, payload: Dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def stream_claude_message_payload(message_payload: Dict[str, Any]):
+    """将 Claude message 一次性响应转换为 Anthropic SSE 流。"""
+    start_message = {
+        "id": message_payload.get("id"),
+        "type": "message",
+        "role": "assistant",
+        "model": message_payload.get("model"),
+        "content": [],
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int((message_payload.get("usage") or {}).get("input_tokens") or 0),
+            "output_tokens": 0,
+        },
+    }
+    yield build_claude_sse_event("message_start", {"type": "message_start", "message": start_message})
+
+    blocks = message_payload.get("content") if isinstance(message_payload.get("content"), list) else []
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+
+        if block_type == "text":
+            yield build_claude_sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+            text_value = str(block.get("text", ""))
+            if text_value:
+                yield build_claude_sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": text_value},
+                    },
+                )
+            yield build_claude_sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
+            continue
+
+        if block_type == "tool_use":
+            yield build_claude_sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "input": {},
+                    },
+                },
+            )
+            partial_json = json.dumps(block.get("input") or {}, ensure_ascii=False)
+            if partial_json:
+                yield build_claude_sse_event(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": partial_json},
+                    },
+                )
+            yield build_claude_sse_event("content_block_stop", {"type": "content_block_stop", "index": index})
+
+    stop_reason = message_payload.get("stop_reason")
+    output_tokens = int((message_payload.get("usage") or {}).get("output_tokens") or 0)
+    yield build_claude_sse_event(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+            },
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
+    yield build_claude_sse_event("message_stop", {"type": "message_stop"})
+
+
 def normalize_tools_from_request(req: ChatRequest) -> List[Dict[str, Any]]:
     """统一兼容 OpenAI tools/functions 两种字段。"""
     normalized_tools: List[Dict[str, Any]] = []
@@ -2037,6 +2482,36 @@ async def chat(
     verify_api_key(API_KEY, authorization)
     # ... (保留原有的chat逻辑)
     return await chat_impl(req, request, authorization)
+
+
+@app.post("/v1/messages")
+async def claude_messages(
+    req: ClaudeMessageRequest,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    x_api_key: Optional[str] = Header(None, alias="x-api-key"),
+    anthropic_version: Optional[str] = Header(None, alias="anthropic-version"),
+    anthropic_beta: Optional[str] = Header(None, alias="anthropic-beta"),
+):
+    """Anthropic Claude Messages API 兼容入口。"""
+    _ = anthropic_version  # 兼容接收，不参与逻辑
+    _ = anthropic_beta
+
+    resolved_authorization = resolve_api_authorization(authorization, x_api_key)
+    verify_api_key(API_KEY, resolved_authorization)
+
+    bridged_req = build_openai_request_from_claude(req)
+    openai_response = await chat_impl(bridged_req, request, resolved_authorization)
+
+    if not isinstance(openai_response, dict):
+        raise HTTPException(status_code=502, detail="Upstream response format error")
+
+    message_payload = convert_openai_response_to_claude_message(openai_response, req.model)
+
+    if req.stream:
+        return StreamingResponse(stream_claude_message_payload(message_payload), media_type="text/event-stream")
+
+    return message_payload
 
 # chat实现函数
 async def chat_impl(
