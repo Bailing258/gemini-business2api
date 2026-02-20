@@ -22,6 +22,7 @@ DEFAULT_XSRF_TOKEN = "KdLRzKwwBTD5wo8nUollAbY6cW0"
 CHROMIUM_PATHS = [
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
+    "/snap/bin/chromium",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
 ]
