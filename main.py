@@ -1578,16 +1578,65 @@ def build_tool_call_instruction(
 
     forced_tool_name = extract_forced_tool_name(tool_choice, function_call)
     tool_names = [str(f.get("name")) for f in function_tools]
+    def summarize_parameters(function_obj: Dict[str, Any]) -> str:
+        parameters = function_obj.get("parameters")
+        if not isinstance(parameters, dict):
+            return ""
+
+        required_fields: List[str] = []
+        required_raw = parameters.get("required")
+        if isinstance(required_raw, list):
+            for item in required_raw:
+                item_text = str(item).strip()
+                if item_text:
+                    required_fields.append(item_text)
+
+        property_briefs: List[str] = []
+        properties = parameters.get("properties")
+        if isinstance(properties, dict):
+            for key, value in list(properties.items())[:20]:
+                key_text = str(key).strip()
+                if not key_text:
+                    continue
+                if isinstance(value, dict):
+                    type_text = str(value.get("type", "any") or "any")
+                    enum_values = value.get("enum")
+                    if isinstance(enum_values, list) and enum_values:
+                        enum_preview = ", ".join([str(v) for v in enum_values[:5]])
+                        property_briefs.append(f"{key_text}<{type_text}, enum:{enum_preview}>")
+                    else:
+                        property_briefs.append(f"{key_text}<{type_text}>")
+                else:
+                    property_briefs.append(f"{key_text}<any>")
+
+        summary_parts = []
+        if required_fields:
+            summary_parts.append(f"required: {', '.join(required_fields)}")
+        if property_briefs:
+            summary_parts.append(f"properties: {', '.join(property_briefs)}")
+
+        summary = " | ".join(summary_parts).strip()
+        if len(summary) > 800:
+            summary = summary[:800] + "..."
+        return summary
+
     tool_desc_lines = []
     for fn in function_tools:
         fn_name = str(fn.get("name", "")).strip()
         if not fn_name:
             continue
         fn_desc = str(fn.get("description", "")).strip()
+        fn_params_summary = summarize_parameters(fn)
         if fn_desc:
-            tool_desc_lines.append(f"- {fn_name}: {fn_desc}")
+            if fn_params_summary:
+                tool_desc_lines.append(f"- {fn_name}: {fn_desc} | {fn_params_summary}")
+            else:
+                tool_desc_lines.append(f"- {fn_name}: {fn_desc}")
         else:
-            tool_desc_lines.append(f"- {fn_name}")
+            if fn_params_summary:
+                tool_desc_lines.append(f"- {fn_name}: {fn_params_summary}")
+            else:
+                tool_desc_lines.append(f"- {fn_name}")
 
     if forced_tool_name and forced_tool_name not in tool_names:
         forced_tool_name = None
@@ -1601,6 +1650,7 @@ def build_tool_call_instruction(
         "\n[Tool Calling Rule]\n"
         f"Available tools:\n{chr(10).join(tool_desc_lines)}\n"
         f"{choice_rule}\n"
+        "You MUST include all required parameters defined by each tool schema.\n"
         "If calling tool(s), respond ONLY with valid JSON, no markdown:\n"
         "{\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{...}}]}\n"
         "If not calling tools, return normal plain text response."
@@ -3219,7 +3269,10 @@ def parse_images_from_response(data_list: list) -> tuple[list, str]:
 async def stream_chat_generator(session: str, text_content: str, file_ids: List[str], model_name: str, chat_id: str, created_time: int, account_manager: AccountManager, is_stream: bool = True, request_id: str = "", request: Request = None):
     start_time = time.time()
     full_content = ""
+    full_reasoning = ""
     first_response_time = None
+    last_answer_state = ""
+    last_intent_classifications: List[str] = []
 
     # 记录发送给API的内容
     text_preview = text_content[:500] + "...(已截断)" if len(text_content) > 500 else text_content
@@ -3300,6 +3353,11 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
 
                 stream_response = json_obj.get("streamAssistResponse", {})
                 answer = stream_response.get("answer", {})
+                if isinstance(answer, dict):
+                    last_answer_state = str(answer.get("state", "") or "")
+                    raw_intents = answer.get("intentClassifications", [])
+                    if isinstance(raw_intents, list):
+                        last_intent_classifications = [str(x) for x in raw_intents if x is not None]
 
                 # 检查是否被政策阻止
                 answer_state = answer.get("state", "")
@@ -3371,6 +3429,7 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                     # 区分思考过程和正常内容
                     if content_obj.get("thought"):
                         # 思考过程使用 reasoning_content 字段（类似 OpenAI o1）
+                        full_reasoning += text
                         if first_response_time is None:
                             first_response_time = time.time()
                             if request is not None:
@@ -3409,10 +3468,36 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                     if json_objects:
                         logger.warning(f"[API] [{account_manager.config.account_id}] [req_{request_id}] 第一个响应完整结构: {json.dumps(json_objects[0], ensure_ascii=False)}")
 
-                    # 重置 first_response_time 并抛异常，触发调用方切换账号重试
-                    if request is not None:
-                        request.state.first_response_time = None
-                    raise HTTPException(status_code=502, detail="Thinking model produced thoughts but no final content")
+                    # 上游已成功完成但无最终文本：返回兜底提示，避免无限切号重试
+                    if last_answer_state == "SUCCEEDED":
+                        intent_suffix = f" (intent={','.join(last_intent_classifications)})" if last_intent_classifications else ""
+                        fallback_text = (
+                            f"模型已完成处理但未返回可见正文{intent_suffix}。"
+                            "这通常是提示词过长、工具上下文过重或仅产出中间思考导致。"
+                            "请缩短输入或分步调用后重试。"
+                        )
+                        if first_response_time is None:
+                            first_response_time = time.time()
+                            if request is not None:
+                                request.state.first_response_time = first_response_time
+                        full_content += fallback_text
+                        chunk = create_chunk(chat_id, created_time, model_name, {"content": fallback_text}, None)
+                        yield f"data: {chunk}\n\n"
+                    elif full_reasoning.strip():
+                        # 至少有思考片段时，不再抛502，避免无意义重试风暴
+                        fallback_text = "模型仅返回思考片段，未产出最终正文。请精简提示词或减少工具上下文后重试。"
+                        if first_response_time is None:
+                            first_response_time = time.time()
+                            if request is not None:
+                                request.state.first_response_time = first_response_time
+                        full_content += fallback_text
+                        chunk = create_chunk(chat_id, created_time, model_name, {"content": fallback_text}, None)
+                        yield f"data: {chunk}\n\n"
+                    else:
+                        # 真正空响应仍按错误处理，触发重试
+                        if request is not None:
+                            request.state.first_response_time = None
+                        raise HTTPException(status_code=502, detail="Thinking model produced thoughts but no final content")
 
 
         except ValueError as e:
