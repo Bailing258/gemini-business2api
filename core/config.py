@@ -51,7 +51,7 @@ class BasicConfig(BaseModel):
     duckmail_base_url: str = Field(default="https://api.duckmail.sbs", description="DuckMail API地址")
     duckmail_api_key: str = Field(default="", description="DuckMail API key")
     duckmail_verify_ssl: bool = Field(default=True, description="DuckMail SSL校验")
-    temp_mail_provider: str = Field(default="moemail", description="临时邮箱提供商: moemail/duckmail/freemail/gptmail")
+    temp_mail_provider: str = Field(default="moemail", description="临时邮箱提供商: moemail/duckmail/freemail/domainmail/gptmail")
     moemail_base_url: str = Field(default="https://moemail.nanohajimi.mom", description="Moemail API地址")
     moemail_api_key: str = Field(default="", description="Moemail API key")
     moemail_domain: str = Field(default="", description="Moemail 邮箱域名（可选，留空则随机选择）")

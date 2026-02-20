@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 from core.account import load_accounts_from_source
 from core.base_task_service import BaseTask, BaseTaskService, TaskCancelledError, TaskStatus
 from core.config import config
+from core.domain_mail import DOMAIN_MAIL_BASE_URL, DOMAIN_MAIL_JWT_TOKEN
 from core.mail_providers import create_temp_mail_client
 from core.gemini_automation import GeminiAutomation
 from core.proxy_utils import parse_proxy_setting
@@ -236,6 +237,13 @@ class RegisterService(BaseTaskService[RegisterTask]):
             config_data["mail_jwt_token"] = config.basic.freemail_jwt_token
             config_data["mail_verify_ssl"] = config.basic.freemail_verify_ssl
             config_data["mail_domain"] = config.basic.freemail_domain
+        elif temp_mail_provider == "domainmail":
+            config_data["mail_password"] = ""
+            config_data["mail_base_url"] = DOMAIN_MAIL_BASE_URL
+            config_data["mail_jwt_token"] = DOMAIN_MAIL_JWT_TOKEN
+            config_data["mail_verify_ssl"] = True
+            if domain:
+                config_data["mail_domain"] = domain
         elif temp_mail_provider == "gptmail":
             config_data["mail_password"] = ""
             config_data["mail_base_url"] = config.basic.gptmail_base_url

@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional
 from core.account import load_accounts_from_source
 from core.base_task_service import BaseTask, BaseTaskService, TaskCancelledError, TaskStatus
 from core.config import config
+from core.domain_mail import DOMAIN_MAIL_BASE_URL, DOMAIN_MAIL_JWT_TOKEN
 from core.mail_providers import create_temp_mail_client
 from core.gemini_automation import GeminiAutomation
 from core.microsoft_mail_client import MicrosoftMailClient
@@ -211,8 +212,8 @@ class LoginService(BaseTaskService[LoginTask]):
                 log_callback=log_cb,
             )
             client.set_credentials(mail_address)
-        elif mail_provider in ("duckmail", "moemail", "freemail", "gptmail"):
-            if mail_provider not in ("freemail", "gptmail") and not mail_password:
+        elif mail_provider in ("duckmail", "moemail", "freemail", "gptmail", "domainmail"):
+            if mail_provider not in ("freemail", "gptmail", "domainmail") and not mail_password:
                 error_message = "邮箱密码缺失" if mail_provider == "duckmail" else "mail password (email_id) missing"
                 return {"success": False, "email": account_id, "error": error_message}
             if mail_provider == "freemail" and not account.get("mail_jwt_token") and not config.basic.freemail_jwt_token:
@@ -233,6 +234,10 @@ class LoginService(BaseTaskService[LoginTask]):
                 account_config["verify_ssl"] = account["mail_verify_ssl"]
             if account.get("mail_domain"):
                 account_config["domain"] = account["mail_domain"]
+            if mail_provider == "domainmail":
+                account_config.setdefault("base_url", DOMAIN_MAIL_BASE_URL)
+                account_config.setdefault("jwt_token", DOMAIN_MAIL_JWT_TOKEN)
+                account_config.setdefault("verify_ssl", True)
 
             # 创建客户端（工厂会优先使用传入的参数，其次使用全局配置）
             client = create_temp_mail_client(
@@ -274,7 +279,7 @@ class LoginService(BaseTaskService[LoginTask]):
         # 更新账户配置
         config_data = result["config"]
         config_data["mail_provider"] = mail_provider
-        if mail_provider in ("freemail", "gptmail"):
+        if mail_provider in ("freemail", "gptmail", "domainmail"):
             config_data["mail_password"] = ""
         else:
             config_data["mail_password"] = mail_password
@@ -283,6 +288,10 @@ class LoginService(BaseTaskService[LoginTask]):
             config_data["mail_client_id"] = mail_client_id
             config_data["mail_refresh_token"] = mail_refresh_token
             config_data["mail_tenant"] = mail_tenant
+        elif mail_provider == "domainmail":
+            config_data["mail_base_url"] = account.get("mail_base_url") or DOMAIN_MAIL_BASE_URL
+            config_data["mail_jwt_token"] = account.get("mail_jwt_token") or DOMAIN_MAIL_JWT_TOKEN
+            config_data["mail_verify_ssl"] = account.get("mail_verify_ssl") if account.get("mail_verify_ssl") is not None else True
         config_data["disabled"] = account.get("disabled", False)
 
         for acc in accounts:
@@ -334,6 +343,8 @@ class LoginService(BaseTaskService[LoginTask]):
             elif mail_provider == "freemail":
                 if not config.basic.freemail_jwt_token:
                     continue
+            elif mail_provider == "domainmail":
+                pass
             elif mail_provider == "gptmail":
                 # GPTMail 不需要密码，允许直接刷新
                 pass

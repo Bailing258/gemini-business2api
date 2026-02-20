@@ -1,6 +1,7 @@
 from typing import Callable, Optional
 
 from core.config import config
+from core.domain_mail import DOMAIN_MAIL_BASE_URL, DOMAIN_MAIL_JWT_TOKEN
 from core.proxy_utils import extract_host, no_proxy_matches, parse_proxy_setting
 from core.duckmail_client import DuckMailClient
 from core.freemail_client import FreemailClient
@@ -52,6 +53,18 @@ def create_temp_mail_client(
             jwt_token=jwt_token or config.basic.freemail_jwt_token,
             proxy=proxy,
             verify_ssl=verify_ssl if verify_ssl is not None else config.basic.freemail_verify_ssl,
+            log_callback=log_cb,
+        )
+
+    if provider == "domainmail":
+        effective_base_url = base_url or DOMAIN_MAIL_BASE_URL
+        if no_proxy_matches(extract_host(effective_base_url), no_proxy):
+            proxy = ""
+        return FreemailClient(
+            base_url=effective_base_url,
+            jwt_token=jwt_token or DOMAIN_MAIL_JWT_TOKEN,
+            proxy=proxy,
+            verify_ssl=verify_ssl if verify_ssl is not None else True,
             log_callback=log_cb,
         )
 

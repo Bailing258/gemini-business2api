@@ -1,7 +1,7 @@
 import random
 import string
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import requests
 
@@ -32,8 +32,33 @@ class FreemailClient:
         """设置邮箱凭证（Freemail 不需要密码）"""
         self.email = email
 
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+    @staticmethod
+    def _clone_request_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        cloned: Dict[str, Any] = {}
+        for key, value in kwargs.items():
+            if isinstance(value, dict):
+                cloned[key] = dict(value)
+            else:
+                cloned[key] = value
+        return cloned
+
+    def _request(self, method: str, url: str, *, use_admin_token_query: bool = False, **kwargs) -> requests.Response:
         """发送请求并打印日志"""
+        headers = kwargs.pop("headers", None) or {}
+        params = kwargs.pop("params", None)
+
+        if self.jwt_token:
+            headers.setdefault("Authorization", f"Bearer {self.jwt_token}")
+            headers.setdefault("X-Admin-Token", self.jwt_token)
+
+            if use_admin_token_query:
+                params = dict(params or {})
+                params.setdefault("admin_token", self.jwt_token)
+
+        kwargs["headers"] = headers
+        if params is not None:
+            kwargs["params"] = params
+
         self._log("info", f"📤 发送 {method} 请求: {url}")
         if "params" in kwargs:
             self._log("info", f"🔎 参数: {kwargs['params']}")
@@ -59,21 +84,40 @@ class FreemailClient:
             self._log("error", f"❌ 网络请求失败: {e}")
             raise
 
+    def _request_with_auth_fallback(self, method: str, url: str, **kwargs) -> requests.Response:
+        primary_kwargs = self._clone_request_kwargs(kwargs)
+        res = self._request(method, url, use_admin_token_query=False, **primary_kwargs)
+
+        if res.status_code not in (401, 403) or not self.jwt_token:
+            return res
+
+        self._log("warning", "⚠️ Header 鉴权失败，尝试 admin_token Query 方式重试")
+        fallback_kwargs = self._clone_request_kwargs(kwargs)
+        return self._request(method, url, use_admin_token_query=True, **fallback_kwargs)
+
     def register_account(self, domain: Optional[str] = None) -> bool:
         """创建新的临时邮箱"""
         try:
-            params = {"admin_token": self.jwt_token}
+            params = {}
             if domain:
                 params["domain"] = domain
                 self._log("info", f"📧 使用域名: {domain}")
             else:
                 self._log("info", "🔍 自动选择域名...")
 
-            res = self._request(
-                "POST",
-                f"{self.base_url}/api/generate",
-                params=params,
-            )
+            res = None
+            for method in ("GET", "POST"):
+                res = self._request_with_auth_fallback(
+                    method,
+                    f"{self.base_url}/api/generate",
+                    params=params,
+                )
+                if res.status_code not in (404, 405):
+                    break
+
+            if res is None:
+                self._log("error", "❌ Freemail 创建失败: 未获取到响应")
+                return False
 
             if res.status_code in (200, 201):
                 data = res.json() if res.content else {}
@@ -111,10 +155,9 @@ class FreemailClient:
             self._log("info", "📬 正在拉取 Freemail 邮件列表...")
             params = {
                 "mailbox": self.email,
-                "admin_token": self.jwt_token,
             }
 
-            res = self._request(
+            res = self._request_with_auth_fallback(
                 "GET",
                 f"{self.base_url}/api/emails",
                 params=params,
@@ -128,7 +171,16 @@ class FreemailClient:
                 self._log("error", f"❌ 获取邮件列表失败: HTTP {res.status_code}")
                 return None
 
-            emails = res.json() if res.content else []
+            payload = res.json() if res.content else []
+            if isinstance(payload, list):
+                emails = payload
+            elif isinstance(payload, dict):
+                emails = payload.get("emails") or payload.get("data") or payload.get("items") or []
+                if isinstance(emails, dict):
+                    emails = emails.get("emails") or emails.get("items") or []
+            else:
+                emails = []
+
             if not isinstance(emails, list):
                 self._log("error", "❌ 响应格式错误（不是列表）")
                 return None
@@ -235,26 +287,37 @@ class FreemailClient:
                 email_id = email_data.get("id")
                 if email_id:
                     # 调用详情接口获取完整内容
-                    detail_res = self._request(
+                    detail_res = self._request_with_auth_fallback(
                         "GET",
                         f"{self.base_url}/api/email/{email_id}",
-                        params={"admin_token": self.jwt_token},
                     )
                     if detail_res.status_code == 200:
                         detail_data = detail_res.json()
-                        content = detail_data.get("content") or ""
-                        html_content = detail_data.get("html_content") or ""
+                        if isinstance(detail_data, dict) and isinstance(detail_data.get("data"), dict):
+                            detail_data = detail_data["data"]
+                        content = (
+                            detail_data.get("content")
+                            or detail_data.get("text")
+                            or detail_data.get("text_content")
+                            or ""
+                        )
+                        html_content = (
+                            detail_data.get("html_content")
+                            or detail_data.get("htmlContent")
+                            or detail_data.get("html")
+                            or ""
+                        )
                     else:
                         # 降级：如果详情接口失败，使用列表中的字段
-                        content = email_data.get("content") or ""
-                        html_content = email_data.get("html_content") or ""
-                        preview = email_data.get("preview") or ""
+                        content = email_data.get("content") or email_data.get("text") or ""
+                        html_content = email_data.get("html_content") or email_data.get("html") or ""
+                        preview = email_data.get("preview") or email_data.get("snippet") or ""
                         content = content + " " + preview
                 else:
                     # 降级：没有 ID，使用列表中的字段
-                    content = email_data.get("content") or ""
-                    html_content = email_data.get("html_content") or ""
-                    preview = email_data.get("preview") or ""
+                    content = email_data.get("content") or email_data.get("text") or ""
+                    html_content = email_data.get("html_content") or email_data.get("html") or ""
+                    preview = email_data.get("preview") or email_data.get("snippet") or ""
                     content = content + " " + preview
 
                 subject = email_data.get("subject") or ""
@@ -302,16 +365,25 @@ class FreemailClient:
     def _get_domain(self) -> str:
         """获取可用域名"""
         try:
-            params = {"admin_token": self.jwt_token}
-            res = self._request(
+            res = self._request_with_auth_fallback(
                 "GET",
                 f"{self.base_url}/api/domains",
-                params=params,
             )
             if res.status_code == 200:
-                domains = res.json() if res.content else []
+                domains_payload = res.json() if res.content else []
+                if isinstance(domains_payload, list):
+                    domains = domains_payload
+                elif isinstance(domains_payload, dict):
+                    domains = domains_payload.get("domains") or domains_payload.get("data") or domains_payload.get("items") or []
+                else:
+                    domains = []
+
                 if isinstance(domains, list) and domains:
-                    return domains[0]
+                    first_domain = domains[0]
+                    if isinstance(first_domain, str):
+                        return first_domain
+                    if isinstance(first_domain, dict):
+                        return first_domain.get("domain") or first_domain.get("name") or ""
         except Exception:
             pass
         return ""

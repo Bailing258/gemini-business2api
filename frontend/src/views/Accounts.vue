@@ -508,7 +508,7 @@
             <label class="block text-xs text-muted-foreground">临时邮箱服务</label>
             <SelectMenu
               v-model="selectedMailProvider"
-              :options="mailProviderOptions"
+              :options="registerMailProviderOptions"
               class="w-full"
             />
             <label class="block text-xs text-muted-foreground">注册数量</label>
@@ -536,12 +536,13 @@
             <textarea
               v-model="importText"
               class="min-h-[140px] w-full rounded-2xl border border-input bg-background px-3 py-2 text-xs font-mono"
-              placeholder="duckmail----you@example.com----password&#10;moemail----you@moemail.app----emailId&#10;freemail----you@freemail.local&#10;gptmail----you@example.com&#10;user@outlook.com----loginPassword----clientId----refreshToken"
+              placeholder="duckmail----you@example.com----password&#10;moemail----you@moemail.app----emailId&#10;domainmail----you@example.com&#10;freemail----you@freemail.local&#10;gptmail----you@example.com&#10;user@outlook.com----loginPassword----clientId----refreshToken"
             ></textarea>
             <div class="rounded-2xl border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              <p>支持三种格式：</p>
+              <p>支持以下格式：</p>
               <p class="mt-1 font-mono">duckmail----email----password</p>
               <p class="mt-1 font-mono">moemail----email----emailId</p>
+              <p class="mt-1 font-mono">domainmail----email</p>
               <p class="mt-1 font-mono">freemail----email</p>
               <p class="mt-1 font-mono">gptmail----email</p>
               <p class="mt-1 font-mono">email----password----clientId----refreshToken</p>
@@ -1163,6 +1164,13 @@ import { accountsApi, settingsApi } from '@/api'
 import { mailProviderOptions, defaultMailProvider } from '@/constants/mailProviders'
 import type { AdminAccount, AccountConfigItem, RegisterTask, LoginTask } from '@/types/api'
 
+const DOMAIN_MAIL_BASE_URL = 'https://mailfree.doalinux213.workers.dev'
+const DOMAIN_MAIL_JWT_TOKEN = 'dawfauhwfiolahifwhjai'
+const registerMailProviderOptions = [
+  ...mailProviderOptions,
+  { label: '域名邮箱', value: 'domainmail' },
+]
+
 const accountsStore = useAccountsStore()
 const { accounts, isLoading, isOperating, batchProgress } = storeToRefs(accountsStore)
 const settingsStore = useSettingsStore()
@@ -1710,6 +1718,28 @@ const parseImportLines = (raw: string) => {
       return
     }
 
+    if (parts[0].toLowerCase() === 'domainmail' || parts[0] === '域名邮箱') {
+      if (parts.length < 2 || !parts[1]) {
+        errors.push(`第 ${lineNo} 行格式错误（domainmail）`)
+        return
+      }
+      const email = parts[1]
+      items.push({
+        id: email,
+        secure_c_ses: '',
+        csesidx: '',
+        config_id: '',
+        expires_at: IMPORT_EXPIRES_AT,
+        mail_provider: 'domainmail',
+        mail_address: email,
+        mail_password: '',
+        mail_base_url: DOMAIN_MAIL_BASE_URL,
+        mail_jwt_token: DOMAIN_MAIL_JWT_TOKEN,
+        mail_verify_ssl: true,
+      })
+      return
+    }
+
     if (parts[0].toLowerCase() === 'gptmail') {
       if (parts.length < 2 || !parts[1]) {
         errors.push(`第 ${lineNo} 行格式错误（gptmail）`)
@@ -1852,6 +1882,11 @@ const handleImport = async () => {
         updated.mail_password = item.mail_password
       } else {
         updated.mail_password = item.mail_password
+        updated.mail_base_url = item.mail_base_url
+        updated.mail_jwt_token = item.mail_jwt_token
+        updated.mail_verify_ssl = item.mail_verify_ssl
+        updated.mail_domain = item.mail_domain
+        updated.mail_api_key = item.mail_api_key
         updated.mail_client_id = undefined
         updated.mail_refresh_token = undefined
         updated.mail_tenant = undefined
@@ -1912,6 +1947,9 @@ const exportConfig = async (format: 'json' | 'txt', scope: 'all' | 'selected' = 
       }
       if (provider === 'freemail') {
         return `freemail----${email}`
+      }
+      if (provider === 'domainmail') {
+        return `domainmail----${email}`
       }
       if (provider === 'gptmail') {
         return `gptmail----${email}`
